@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -9,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -22,20 +22,15 @@ import (
 
 // --- 逻辑函数 ---
 
-func generateDailyKey(seed string) string {
-	today := time.Now().Format("20060102")
-	combined := seed + today
-	hash := sha256.Sum256([]byte(combined))
+// processUserKey 将用户输入的任意文本转换为 32 字符长度的密钥
+// 因为 AES 加密要求密钥长度必须固定（如 16/24/32 字节），不能直接用用户输入的 "123"
+func processUserKey(input string) string {
+	// 使用 SHA256 将输入变为固定的 64 字符 hex 串
+	hash := sha256.Sum256([]byte(input))
 	keyHex := hex.EncodeToString(hash[:])
-	if len(keyHex) >= 32 {
-		return keyHex[:32]
-	}
-	md5Hash := md5.Sum([]byte(keyHex))
-	return keyHex[:24] + hex.EncodeToString(md5Hash[:])[:8]
+	// 截取前 32 个字符作为密钥 (适配原代码逻辑)
+	return keyHex[:32]
 }
-
-var seed = "my-secret-seed-2024"
-var key = generateDailyKey(seed)
 
 func init() {
 	fontPath := "./msyh.ttf"
@@ -44,12 +39,23 @@ func init() {
 	}
 }
 
+func isPrintable(s string) bool {
+	for _, r := range s {
+		// unicode.IsPrint 会检查字符是否为可打印字符（包括空格、汉字、字母等）
+		// 如果包含不可见的二进制乱码，它会返回 false
+		if !unicode.IsPrint(r) && !unicode.IsGraphic(r) && r != '\n' && r != '\r' && r != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
 // --- 界面入口 ---
 
 func main() {
 	myApp := app.New()
 	myApp.Settings().SetTheme(theme.LightTheme())
-	myWindow := myApp.NewWindow("AES 加密聊天终端")
+	myWindow := myApp.NewWindow("AES 自定义密钥聊天")
 	myWindow.Resize(fyne.NewSize(600, 500))
 
 	showConnectScreen(myWindow)
@@ -57,7 +63,7 @@ func main() {
 	myWindow.ShowAndRun()
 }
 
-// 1. 连接界面 (已修复布局宽度和语法错误)
+// 1. 连接界面 (增加了密钥输入框)
 func showConnectScreen(win fyne.Window) {
 	ipInput := widget.NewEntry()
 	ipInput.SetText("127.0.0.1")
@@ -65,20 +71,36 @@ func showConnectScreen(win fyne.Window) {
 	portInput := widget.NewEntry()
 	portInput.SetText("8000")
 
+	// 新增：密钥输入框 (使用 PasswordEntry 隐藏输入内容)
+	keyInput := widget.NewPasswordEntry()
+	keyInput.PlaceHolder = "请输入约定的加密密码"
+	keyInput.SetText("123456") // 默认值方便测试
+
 	form := &widget.Form{
 		Items: []*widget.FormItem{
 			{Text: "服务器 IP", Widget: ipInput},
 			{Text: "端口号", Widget: portInput},
+			{Text: "加密密钥", Widget: keyInput}, // 将新输入框加入表单
 		},
-		SubmitText: "连接服务器",
+		SubmitText: "连接并设定密钥",
 		OnSubmit: func() {
+			if keyInput.Text == "" {
+				dialog.ShowError(fmt.Errorf("密钥不能为空"), win)
+				return
+			}
+
+			// 处理密钥：将用户输入的密码转为 AES 可用的 key
+			finalKey := processUserKey(keyInput.Text)
+
 			address := ipInput.Text + ":" + portInput.Text
 			conn, err := net.DialTimeout("tcp", address, 5*time.Second)
 			if err != nil {
 				dialog.ShowError(fmt.Errorf("连接失败: %v", err), win)
 				return
 			}
-			showChatScreen(win, conn)
+
+			// 将生成的 key 传给聊天界面
+			showChatScreen(win, conn, finalKey)
 		},
 	}
 
@@ -88,21 +110,21 @@ func showConnectScreen(win fyne.Window) {
 		form,
 	)
 
-	// 这里强制给容器 450x200 的大小，解决“太短”的问题
 	centeredBox := container.NewCenter(
-		container.NewGridWrap(fyne.NewSize(450, 200), formContainer),
+		container.NewGridWrap(fyne.NewSize(450, 250), formContainer), // 稍微调高一点高度适应新输入框
 	)
 
 	win.SetContent(centeredBox)
 }
 
-// 2. 聊天界面
-func showChatScreen(win fyne.Window, conn net.Conn) {
+// 2. 聊天界面 (接收 userKey 参数)
+func showChatScreen(win fyne.Window, conn net.Conn, userKey string) {
 	richText := widget.NewRichText()
 	richText.Wrapping = fyne.TextWrapWord
 	scroll := container.NewVScroll(richText)
 
-	statusLabel := widget.NewLabel("状态: 已连接至 " + conn.RemoteAddr().String())
+	// 在标题栏显示部分密钥信息（可选，用于核对）
+	statusLabel := widget.NewLabel(fmt.Sprintf("已连接 | 密钥指纹: %s...", userKey[:4]))
 
 	appendLog := func(msg string) {
 		timestamp := time.Now().Format("15:04:05")
@@ -119,6 +141,12 @@ func showChatScreen(win fyne.Window, conn net.Conn) {
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Println("捕获到异常，防止了闪退:", r)
+			}
+			conn.Close()
+		}()
 		defer conn.Close()
 		buf := make([]byte, 2048)
 		for {
@@ -132,9 +160,17 @@ func showChatScreen(win fyne.Window, conn net.Conn) {
 			if idx != -1 {
 				sender := raw[:idx]
 				cipher := raw[idx+1:]
-				plain, err := go_crypto.AESCBCDecrypt(cipher, key)
+				// 使用传入的 userKey 进行解密
+				plain, err := go_crypto.AESCBCDecrypt(cipher, userKey)
 				if err == nil {
-					appendLog(sender + ": " + plain)
+					if isPrintable(plain) {
+						appendLog(sender + ": " + plain)
+					} else {
+						appendLog("[警告] 收到一条包含不可打印字符的消息 (可能密钥不匹配)")
+					}
+				} else {
+					// 如果密钥不对，解密会失败，这里提示一下
+					appendLog("[警告] 收到一条无法解密的消息 (可能密钥不匹配)")
 				}
 			}
 		}
@@ -148,10 +184,13 @@ func showChatScreen(win fyne.Window, conn net.Conn) {
 		if text == "" {
 			return
 		}
-		cipher, _ := go_crypto.AESCBCEncrypt(text, key)
+		// 使用传入的 userKey 进行加密
+		cipher, _ := go_crypto.AESCBCEncrypt(text, userKey)
 		_, err := conn.Write([]byte(cipher))
 		if err == nil {
 			inputWidget.SetText("")
+			// 本地回显（为了体验更好，可选）
+			// appendLog("我: " + text)
 		} else {
 			appendLog("[系统] 发送失败")
 		}
@@ -170,5 +209,5 @@ func showChatScreen(win fyne.Window, conn net.Conn) {
 	content := container.NewBorder(container.NewVBox(top, widget.NewSeparator()), bottom, nil, nil, scroll)
 
 	win.SetContent(content)
-	appendLog("[系统] 连接成功！可以开始聊天了")
+	appendLog("[系统] 连接成功！双方必须使用相同密码才能正常通信。")
 }
